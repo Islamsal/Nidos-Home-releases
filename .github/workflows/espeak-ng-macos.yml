@@ -166,7 +166,9 @@ jobs:
             echo; echo "== lipo -info"; lipo -info "$P/bin/espeak-ng"
             for a in arm64 x86_64; do
               echo; echo "== otool -L ($a)"; otool -L -arch "$a" "$P/bin/espeak-ng"
-              echo; echo "== minimum macOS ($a)"; otool -l -arch "$a" "$P/bin/espeak-ng" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk'
+              # A 10.13 target carries LC_VERSION_MIN_MACOSX, 11.0 LC_BUILD_VERSION.
+              echo; echo "== minimum macOS ($a)"
+              otool -l -arch "$a" "$P/bin/espeak-ng" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' | grep -E 'minos|version|sdk' || echo "(no version load command found)"
             done
             echo; echo "== codesign -dvvv"; codesign -dvvv "$P/bin/espeak-ng" 2>&1
             echo; echo "== tarball"; tar -tvzf "$OUT/$TARBALL"
