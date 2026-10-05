@@ -1,0 +1,265 @@
+name: espeak-ng 1.52.0 helper for macOS
+
+# Builds the pronunciation helper Nido's Home downloads on macOS: espeak-ng
+# 1.52.0 from its upstream source, UNMODIFIED, as one universal program
+# (arm64 + x86_64) with English-only data. The app runs it only as a separate
+# program; it never links it.
+#
+# Dispatch only, and it publishes nothing: the helper tarball, the unmodified
+# source tarball and BUILD.txt are uploaded as workflow artifacts, checked by
+# hand, and only then published as a pre-release.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: espeak-ng-macos
+  cancel-in-progress: false
+
+env:
+  ESPEAK_VERSION: "1.52.0"
+  # espeak-ng publishes no source tarball for 1.52.0, so the source is the
+  # tag's archive, pinned by its SHA-256 and by the commit it embeds.
+  ESPEAK_COMMIT: 4870adfa25b1a32b4361592f1be8a40337c58d6c
+  SOURCE_URL: https://github.com/espeak-ng/espeak-ng/archive/refs/tags/1.52.0.tar.gz
+  SOURCE_NAME: espeak-ng-1.52.0.tar.gz
+  SOURCE_SHA256: bb4338102ff3b49a81423da8a1a158b420124b055b60fa76cfb4b18677130a23
+  SOURCE_BYTES: "17739803"
+  TARBALL: espeak-ng-1.52.0-macos-universal.tar.gz
+  # No audio output, sonic, klatt, speechPlayer or mbrola: the app asks only
+  # for phonemes. Static, so the program needs no library of its own.
+  CONFIGURE_FLAGS: >-
+    --disable-shared --enable-static
+    --with-pcaudiolib=no --with-sonic=no --with-klatt=no
+    --with-speechplayer=no --with-mbrola=no
+    --with-extdict-ru=no --with-extdict-cmn=no --with-extdict-yue=no
+  # The check list below, and its output from the same source built on Linux.
+  CHECK_WORDS_SHA256: ed39ec5b81d416f3861bdcc5a303fba4ce04cdf7b195add6bde99573677265a9
+  CHECK_SHA256: d90f732ad09fa7d45bf3f6c1619c82eaa396885f1621c69b2c680f073ade05df
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORK: ${{ github.workspace }}/work
+      OUT: ${{ github.workspace }}/out
+    steps:
+      - name: Runner and tools
+        run: |
+          mkdir -p "$WORK" "$OUT"
+          brew install autoconf automake libtool
+          {
+            echo "espeak-ng $ESPEAK_VERSION for macOS (universal), built unmodified"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "workflow commit: $GITHUB_SHA"
+            echo
+            echo "== runner"
+            sw_vers
+            uname -m
+            xcodebuild -version
+            clang --version | head -1
+            autoconf --version | head -1
+            automake --version | head -1
+            glibtoolize --version | head -1
+            echo
+            echo "== commands: Runner and tools"
+            cat "$0"
+          } > "$OUT/BUILD.txt"
+
+      - name: Fetch and verify the source
+        run: |
+          cd "$WORK"
+          curl -fsSL --retry 3 -o "$SOURCE_NAME" "$SOURCE_URL"
+          echo "$SOURCE_SHA256  $SOURCE_NAME" | shasum -a 256 -c -
+          test "$(stat -f %z "$SOURCE_NAME")" = "$SOURCE_BYTES"
+          test "$(gzip -dc "$SOURCE_NAME" | git get-tar-commit-id)" = "$ESPEAK_COMMIT"
+          cp "$SOURCE_NAME" "$OUT/$SOURCE_NAME"
+          { echo; echo "== commands: Fetch and verify the source"; cat "$0"; } >> "$OUT/BUILD.txt"
+
+      - name: Build the arm64 and x86_64 programs
+        run: |
+          cd "$WORK"
+          build() {
+            local arch=$1 host=$2 min=$3
+            rm -rf "build-$arch" && mkdir "build-$arch"
+            tar -xzf "$SOURCE_NAME" -C "build-$arch" --strip-components=1
+            (
+              cd "build-$arch"
+              ./autogen.sh
+              # shellcheck disable=SC2086
+              ./configure --build=aarch64-apple-darwin --host="$host" $CONFIGURE_FLAGS \
+                CC="clang -arch $arch -mmacosx-version-min=$min" \
+                CXX="clang++ -arch $arch -mmacosx-version-min=$min"
+              make -j"$(sysctl -n hw.ncpu)" src/espeak-ng
+            )
+          }
+          build arm64 aarch64-apple-darwin 11.0
+          build x86_64 x86_64-apple-darwin 10.13
+          {
+            echo; echo "== commands: Build the arm64 and x86_64 programs"; cat "$0"
+            echo; echo "== config.h, x86_64 against arm64"
+            diff build-arm64/config.h build-x86_64/config.h || true
+            echo; echo "== compiled"
+            find build-arm64/src -name '*.o' | sed 's#^build-arm64/##' | sort
+          } >> "$OUT/BUILD.txt"
+
+      - name: Build the English data
+        run: |
+          cd "$WORK/build-arm64"
+          make en
+          { echo; echo "== commands: Build the English data"; cat "$0"; } >> "$OUT/BUILD.txt"
+
+      - name: Assemble, sign and pack
+        run: |
+          cd "$WORK"
+          P=pkg
+          rm -rf "$P" && mkdir -p "$P/bin" "$P/espeak-ng-data/lang/gmw"
+          lipo -create -output "$P/bin/espeak-ng" build-arm64/src/espeak-ng build-x86_64/src/espeak-ng
+          for f in en_dict phondata phonindex phontab intonations; do
+            cp "build-arm64/espeak-ng-data/$f" "$P/espeak-ng-data/"
+          done
+          cp build-arm64/espeak-ng-data/lang/gmw/en-US "$P/espeak-ng-data/lang/gmw/"
+          cp build-arm64/COPYING build-arm64/COPYING.APACHE build-arm64/COPYING.BSD2 build-arm64/COPYING.UCD "$P/"
+          cat > "$P/SOURCE.txt" <<EOF
+          espeak-ng $ESPEAK_VERSION, built unmodified from its upstream source.
+          Licence: GPL-3.0-or-later (COPYING). Nido's Home runs it only as a separate program.
+
+          Source: $SOURCE_NAME, published beside this program in the same release:
+            https://github.com/Islamsal/Nidos-Home-releases/releases/tag/read-aloud-espeak-1_52_0-st1
+          byte-identical to $SOURCE_URL
+            sha256 $SOURCE_SHA256, commit $ESPEAK_COMMIT
+          Upstream: https://github.com/espeak-ng/espeak-ng
+          How it was built: BUILD.txt in the same release.
+          EOF
+          # Ad-hoc signed AFTER lipo (Apple Silicon runs nothing unsigned).
+          codesign --force --sign - "$P/bin/espeak-ng"
+          codesign --verify --strict --verbose=2 "$P/bin/espeak-ng"
+          codesign --verify --strict --arch arm64 "$P/bin/espeak-ng"
+          codesign --verify --strict --arch x86_64 "$P/bin/espeak-ng"
+          test "$(lipo -archs "$P/bin/espeak-ng" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+          for a in arm64 x86_64; do
+            otool -L -arch "$a" "$P/bin/espeak-ng" | tail -n +2 | awk '{print $1}' | while read -r lib; do
+              case "$lib" in
+                /usr/lib/*|/System/Library/*) ;;
+                *) echo "::error::$a links $lib, which is not a system library"; exit 1 ;;
+              esac
+            done
+          done
+          find "$P" -type d -exec chmod 755 {} +
+          find "$P" -type f -exec chmod 644 {} +
+          chmod 755 "$P/bin/espeak-ng"
+          (cd "$P" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel \
+            -cf - bin espeak-ng-data COPYING COPYING.APACHE COPYING.BSD2 COPYING.UCD SOURCE.txt) | gzip -9n > "$OUT/$TARBALL"
+          if tar -tzf "$OUT/$TARBALL" | grep -q '\._'; then echo "::error::AppleDouble entries in the tarball"; exit 1; fi
+          if tar -tvzf "$OUT/$TARBALL" | grep -qv '^[-d]'; then echo "::error::an entry that is not a file or a directory"; exit 1; fi
+          {
+            echo; echo "== commands: Assemble, sign and pack"; cat "$0"
+            echo; echo "== lipo -info"; lipo -info "$P/bin/espeak-ng"
+            for a in arm64 x86_64; do
+              echo; echo "== otool -L ($a)"; otool -L -arch "$a" "$P/bin/espeak-ng"
+              echo; echo "== minimum macOS ($a)"; otool -l -arch "$a" "$P/bin/espeak-ng" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk'
+            done
+            echo; echo "== codesign -dvvv"; codesign -dvvv "$P/bin/espeak-ng" 2>&1
+            echo; echo "== tarball"; tar -tvzf "$OUT/$TARBALL"
+          } >> "$OUT/BUILD.txt"
+
+      - name: Run both programs on the check list
+        run: |
+          cd "$WORK"
+          cat > check-words.txt <<'EOF'
+          cholangiocarcinoma pheochromocytoma glomerulonephritis hepatosplenomegaly thrombocytopenia agranulocytosis bronchiectasis pneumothorax cardiomyopathy endocarditis
+          pericarditis myocarditis atherosclerosis arteriosclerosis vasculitis polyarteritis sarcoidosis amyloidosis hemochromatosis haemochromatosis
+          pyelonephritis nephrolithiasis cholelithiasis choledocholithiasis pancreatitis diverticulitis appendicitis cholecystitis esophagitis oesophagitis
+          gastroparesis achalasia dysphagia odynophagia hematemesis haematemesis melena hematochezia steatorrhea steatorrhoea
+          encephalopathy encephalitis meningioma glioblastoma ependymoma medulloblastoma craniopharyngioma schwannoma neurofibromatosis syringomyelia
+          myasthenia polymyositis dermatomyositis fibromyalgia rhabdomyolysis osteomyelitis osteoporosis osteomalacia spondylolisthesis kyphoscoliosis
+          hypercalcemia hypocalcemia hyperkalemia hypokalemia hypernatremia hyponatremia hypomagnesemia hyperphosphatemia hypoglycemia ketoacidosis
+          thyrotoxicosis hypothyroidism hyperaldosteronism hypopituitarism acromegaly gynecomastia hirsutism galactorrhea amenorrhea dysmenorrhea
+          endometriosis adenomyosis salpingitis oligohydramnios polyhydramnios preeclampsia eclampsia chorioamnionitis erythroblastosis cryptorchidism
+          erythema urticaria pemphigus pemphigoid psoriasis vitiligo onychomycosis impetigo cellulitis erysipelas
+          leukocytosis lymphadenopathy splenomegaly myelofibrosis myelodysplasia thalassemia spherocytosis elliptocytosis methemoglobinemia hemoglobinuria
+          toxoplasmosis histoplasmosis coccidioidomycosis blastomycosis aspergillosis cryptococcosis candidiasis leishmaniasis trypanosomiasis schistosomiasis
+          metformin glipizide sitagliptin empagliflozin dapagliflozin pioglitazone liraglutide semaglutide insulin glargine
+          lisinopril enalapril captopril losartan valsartan candesartan amlodipine nifedipine diltiazem verapamil
+          metoprolol atenolol propranolol carvedilol labetalol spironolactone eplerenone furosemide bumetanide hydrochlorothiazide
+          atorvastatin rosuvastatin simvastatin ezetimibe fenofibrate gemfibrozil warfarin apixaban rivaroxaban dabigatran
+          heparin enoxaparin clopidogrel ticagrelor prasugrel alteplase tranexamic aminocaproic desmopressin vasopressin
+          amoxicillin ampicillin piperacillin ceftriaxone cefazolin cefepime vancomycin linezolid daptomycin meropenem
+          gentamicin tobramycin azithromycin clarithromycin doxycycline minocycline ciprofloxacin levofloxacin metronidazole clindamycin
+          fluconazole voriconazole amphotericin caspofungin acyclovir valacyclovir ganciclovir oseltamivir zidovudine tenofovir
+          omeprazole pantoprazole esomeprazole ranitidine famotidine ondansetron metoclopramide prochlorperazine loperamide bisacodyl
+          sertraline fluoxetine paroxetine citalopram escitalopram venlafaxine duloxetine bupropion mirtazapine trazodone
+          haloperidol risperidone olanzapine quetiapine aripiprazole clozapine lithium lamotrigine valproate carbamazepine
+          levetiracetam phenytoin gabapentin pregabalin topiramate lorazepam diazepam alprazolam clonazepam midazolam
+          prednisone prednisolone dexamethasone hydrocortisone methylprednisolone fludrocortisone methotrexate azathioprine cyclosporine tacrolimus
+          rituximab infliximab adalimumab etanercept trastuzumab bevacizumab pembrolizumab nivolumab imatinib erlotinib
+          whereupon nevertheless notwithstanding heretofore inasmuch thoroughfare quintessential serendipity juxtaposition onomatopoeia
+          mischievous pronunciation idiosyncrasy conscientious hierarchical bureaucracy entrepreneur rendezvous silhouette ubiquitous
+          labyrinth chrysanthemum rhododendron archipelago kaleidoscope phenomenon paradigm ephemeral sycophant zeitgeist
+          Worcestershire Massachusetts Connecticut Mississippi Albuquerque Tchaikovsky Nietzsche Schrodinger Dostoevsky Rachmaninoff
+          EOF
+          tr ' ' '\n' < check-words.txt | grep -v '^$' > check-words.list
+          echo "$CHECK_WORDS_SHA256  check-words.list" | shasum -a 256 -c -
+          # From the tarball, laid out as the app installs it.
+          rm -rf x && mkdir x && tar -xzf "$OUT/$TARBALL" -C x
+          test -x x/bin/espeak-ng
+          test "$(ls x/espeak-ng-data | tr '\n' ' ')" = "en_dict intonations lang phondata phonindex phontab "
+          test "$(find x/espeak-ng-data/lang -type f)" = "x/espeak-ng-data/lang/gmw/en-US"
+          run() {
+            arch "-$1" x/bin/espeak-ng --version --path="$PWD/x/espeak-ng-data" | tee -a "$OUT/BUILD.txt" | grep "text-to-speech: $ESPEAK_VERSION " > /dev/null
+            arch "-$1" x/bin/espeak-ng -q --ipa=3 -v en-us --path="$PWD/x/espeak-ng-data" < check-words.list > "$OUT/check-$1.ipa"
+            test "$(wc -l < "$OUT/check-$1.ipa" | tr -d ' ')" = 300
+            echo "$CHECK_SHA256  $OUT/check-$1.ipa" | shasum -a 256 -c -
+          }
+          { echo; echo "== commands: Run both programs on the check list"; cat "$0"; echo; echo "== runs"; } >> "$OUT/BUILD.txt"
+          run arm64
+          echo "arm64 slice: 300 words, output identical to the Linux build" >> "$OUT/BUILD.txt"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            run x86_64
+            echo "x86_64 slice (Rosetta): 300 words, output identical to the Linux build" >> "$OUT/BUILD.txt"
+          else
+            echo "::warning::no Rosetta on this runner: the x86_64 slice was NOT run"
+            echo "x86_64 slice: NOT RUN (this runner has no Rosetta)" >> "$OUT/BUILD.txt"
+          fi
+
+      - name: Data against the Linux build
+        run: |
+          cd "$WORK/x"
+          cat > linux-data.sha256 <<'EOF'
+          1053f74a34af38abb6fbd64b7838dacbc655a687c48ce1bb663d364a127b05de  espeak-ng-data/en_dict
+          031a105bf6bb2ebcd73a2c579ccfb42469b27266db0078af65ae298fd3588b21  espeak-ng-data/intonations
+          41534c2a22df5dd4f1052ff9e1a33a3ea7bff5a26b5c02bdad5ba8ddb7524704  espeak-ng-data/lang/gmw/en-US
+          a0b643b155cb6b12628d9e7865b57d9fca0d35844614f2594a5e009c80c80bb4  espeak-ng-data/phondata
+          384e5fa6f714ba5356c58008249b78699c31c1ad044b243068d263fb806b7d73  espeak-ng-data/phonindex
+          1b40690667e1e9aa1ba5e5234773c799e7e72ea751426e5150423d53c3f24fa2  espeak-ng-data/phontab
+          EOF
+          {
+            echo; echo "== commands: Data against the Linux build"; cat "$0"
+            echo; echo "== data"
+            if shasum -a 256 -c linux-data.sha256; then echo "data: byte-identical to the Linux build"; else echo "data: DIFFERS from the Linux build"; fi
+          } >> "$OUT/BUILD.txt"
+          rm linux-data.sha256
+
+      - name: Hashes
+        run: |
+          cd "$OUT"
+          { echo; echo "== sha256 and size"; for f in "$TARBALL" "$SOURCE_NAME"; do shasum -a 256 "$f"; stat -f '%z %N' "$f"; done; } >> BUILD.txt
+          cat BUILD.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: espeak-ng-1.52.0-macos
+          path: ${{ github.workspace }}/out/
+          if-no-files-found: error
+          retention-days: 14
